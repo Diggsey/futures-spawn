@@ -22,68 +22,74 @@ pub struct MutexTask<T: Send> {
     is_poisoned: bool
 }
 
+impl<T: Send> MutexTask<T> {
+    fn poison<U>(&self, value: U) -> LockResult<U> {
+        if self.is_poisoned {
+            Err(PoisonError::new(value))
+        } else {
+            Ok(value)
+        }
+    }
+
+    fn step(&mut self, state: MutexState<T>) -> (MutexState<T>, Async<bool>) {
+        match state {
+            // Mutex is currently unlocked
+            MutexState::Unlocked(value, cs) => {
+                // Check for lock requests
+                match self.requests.poll() {
+                    // Lock request stream is closed, so mutex task should end
+                    Ok(Async::Ready(None)) => (MutexState::Unlocked(value, cs), Async::Ready(true)),
+                    // Received a lock request
+                    Ok(Async::Ready(Some(LockRequest(req)))) => {
+                        // Create a channel to receive the "unlock" message
+                        let (sender, receiver) = oneshot::channel();
+                        // Send a mutex guard to the lucky locker
+                        let guard = MutexGuard::new(value, sender);
+                        req.complete(self.poison(guard));
+                        // Transition to "locked" state
+                        (MutexState::Locked(receiver, cs), Async::Ready(false))
+                    },
+                    // No requests outstanding
+                    Ok(Async::NotReady) => (MutexState::Unlocked(value, cs), Async::NotReady),
+                    // The mpsc::channel should never return errors...
+                    Err(()) => unreachable!()
+                }
+            },
+            // Mutex is currently locked
+            MutexState::Locked(mut receiver, cs) => {
+                // Check for an unlock notification
+                match receiver.poll() {
+                    // Received an unlock message
+                    Ok(Async::Ready((value, poisoned))) => {
+                        // Unlock and maybe poison the mutex
+                        self.is_poisoned |= poisoned;
+                        (MutexState::Unlocked(value, cs), Async::Ready(false))
+                    },
+                    // No unlock message yet
+                    Ok(Async::NotReady) => (MutexState::Locked(receiver, cs), Async::NotReady),
+                    // MutexGuard should never close the channel before sending an unlock message
+                    Err(_) => unreachable!()
+                }
+            },
+            // We should never be polled while in this transient state
+            MutexState::Invalid => unreachable!()
+        }
+    }
+}
+
 impl<T: Send> Future for MutexTask<T> {
     type Item = ();
     type Error = ();
 
     fn poll(&mut self) -> Poll<(), ()> {
         loop {
-            match mem::replace(&mut self.state, MutexState::Invalid) {
-                // Mutex is currently unlocked
-                MutexState::Unlocked(value, cs) => {
-                    // Check for lock requests
-                    match self.requests.poll() {
-                        // Lock request stream is closed, so mutex task should end
-                        Ok(Async::Ready(None)) => {
-                            self.state = MutexState::Unlocked(value, cs);
-                            return Ok(Async::Ready(()))
-                        },
-                        // Received a lock request
-                        Ok(Async::Ready(Some(LockRequest(req)))) => {
-                            // Create a channel to receive the "unlock" message
-                            let (sender, receiver) = oneshot::channel();
-                            // Transition to "locked" state
-                            self.state = MutexState::Locked(receiver, cs);
-                            // Send a mutex guard to the lucky locker
-                            let guard = MutexGuard::new(value, sender);
-                            req.complete(if self.is_poisoned {
-                                Err(PoisonError::new(guard))
-                            } else {
-                                Ok(guard)
-                            });
-                        },
-                        // No requests outstanding
-                        Ok(Async::NotReady) => {
-                            // Remain in the unlocked state
-                            self.state = MutexState::Unlocked(value, cs);
-                            return Ok(Async::NotReady)
-                        }
-                        // The mpsc::channel should never return errors...
-                        Err(()) => unreachable!()
-                    }
-                },
-                // Mutex is currently locked
-                MutexState::Locked(mut receiver, cs) => {
-                    // Check for an unlock notification
-                    match receiver.poll() {
-                        // Received an unlock message
-                        Ok(Async::Ready((value, poisoned))) => {
-                            // Unlock and maybe poison the mutex
-                            self.is_poisoned |= poisoned;
-                            self.state = MutexState::Unlocked(value, cs);
-                        },
-                        // No unlock message yet
-                        Ok(Async::NotReady) => {
-                            // Remain in locked state
-                            self.state = MutexState::Locked(receiver, cs);
-                            return Ok(Async::NotReady);
-                        },
-                        // MutexGuard should never close the channel before sending an unlock message
-                        Err(_) => unreachable!()
-                    }
-                },
-                // We should never be polled while in this transient state
-                MutexState::Invalid => unreachable!()
+            let old_state = mem::replace(&mut self.state, MutexState::Invalid);
+            let (new_state, result) = self.step(old_state);
+            self.state = new_state;
+            match result {
+                Async::NotReady => return Ok(Async::NotReady),
+                Async::Ready(true) => return Ok(Async::Ready(())),
+                Async::Ready(false) => {}
             }
         }
     }
@@ -92,11 +98,7 @@ impl<T: Send> Future for MutexTask<T> {
 impl<T: Send> Drop for MutexTask<T> {
     fn drop(&mut self) {
         if let MutexState::Unlocked(value, cs) = mem::replace(&mut self.state, MutexState::Invalid) {
-            cs.complete(if self.is_poisoned {
-                Err(PoisonError::new(value))
-            } else {
-                Ok(value)
-            });
+            cs.complete(self.poison(value));
         }
     }
 }
