@@ -14,6 +14,9 @@ extern crate futures;
 
 use futures::{Future};
 
+/// Future-based concurrency primitives
+pub mod sync;
+
 /// Value that can spawn a future
 ///
 /// On spawn, the executor takes ownership of the future and becomes responsible
