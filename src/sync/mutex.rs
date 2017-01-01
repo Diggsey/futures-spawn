@@ -1,17 +1,22 @@
 use super::super::Spawn;
 use futures::sync::{mpsc, oneshot};
-use futures::{Future, Poll, Stream, Async};
-use std::thread;
+use futures::{Future, Poll, Stream, Async, Sink};
 use std::sync::{LockResult, PoisonError};
-use std::mem;
+use std::{mem, thread, fmt};
 use std::ops::{Deref, DerefMut};
+use std::error::Error;
+use self::MutexState::*;
 
 
-struct LockRequest<T: Send>(oneshot::Sender<LockResult<MutexGuard<T>>>);
+type CompletionSender<T> = oneshot::Sender<LockResult<T>>;
+type GuardSender<T> = oneshot::Sender<LockResult<MutexGuard<T>>>;
+type StepResult<T> = (MutexState<T>, Async<bool>);
+
+struct LockRequest<T: Send>(GuardSender<T>);
 
 enum MutexState<T> {
-    Unlocked(T, oneshot::Sender<LockResult<T>>),
-    Locked(oneshot::Receiver<(T, bool)>, oneshot::Sender<LockResult<T>>),
+    Unlocked(T, CompletionSender<T>),
+    Locked(oneshot::Receiver<(T, bool)>, CompletionSender<T>),
     Invalid
 }
 
@@ -31,48 +36,52 @@ impl<T: Send> MutexTask<T> {
         }
     }
 
-    fn step(&mut self, state: MutexState<T>) -> (MutexState<T>, Async<bool>) {
+    fn satisfy_lock_req(&mut self, value: T, req: GuardSender<T>, completion: CompletionSender<T>) -> StepResult<T> {
+        // Create a channel to receive the "unlock" message
+        let (sender, receiver) = oneshot::channel();
+        // Send a mutex guard to the lucky locker
+        let guard = MutexGuard::new(value, sender);
+        req.complete(self.poison(guard));
+        // Transition to "locked" state
+        (Locked(receiver, completion), Async::Ready(false))
+    }
+
+    fn satisfy_unlock_req(&mut self, value: T, poisoned: bool, completion: CompletionSender<T>) -> StepResult<T> {
+        // Unlock and maybe poison the mutex
+        self.is_poisoned |= poisoned;
+        (Unlocked(value, completion), Async::Ready(false))
+    }
+
+    fn step(&mut self, state: MutexState<T>) -> StepResult<T> {
         match state {
             // Mutex is currently unlocked
-            MutexState::Unlocked(value, cs) => {
+            Unlocked(value, completion) => {
                 // Check for lock requests
                 match self.requests.poll() {
                     // Lock request stream is closed, so mutex task should end
-                    Ok(Async::Ready(None)) => (MutexState::Unlocked(value, cs), Async::Ready(true)),
+                    Ok(Async::Ready(None)) => (Unlocked(value, completion), Async::Ready(true)),
                     // Received a lock request
-                    Ok(Async::Ready(Some(LockRequest(req)))) => {
-                        // Create a channel to receive the "unlock" message
-                        let (sender, receiver) = oneshot::channel();
-                        // Send a mutex guard to the lucky locker
-                        let guard = MutexGuard::new(value, sender);
-                        req.complete(self.poison(guard));
-                        // Transition to "locked" state
-                        (MutexState::Locked(receiver, cs), Async::Ready(false))
-                    },
+                    Ok(Async::Ready(Some(LockRequest(req)))) => self.satisfy_lock_req(value, req, completion),
                     // No requests outstanding
-                    Ok(Async::NotReady) => (MutexState::Unlocked(value, cs), Async::NotReady),
+                    Ok(Async::NotReady) => (Unlocked(value, completion), Async::NotReady),
                     // The mpsc::channel should never return errors...
                     Err(()) => unreachable!()
                 }
             },
             // Mutex is currently locked
-            MutexState::Locked(mut receiver, cs) => {
+            Locked(mut receiver, completion) => {
                 // Check for an unlock notification
                 match receiver.poll() {
                     // Received an unlock message
-                    Ok(Async::Ready((value, poisoned))) => {
-                        // Unlock and maybe poison the mutex
-                        self.is_poisoned |= poisoned;
-                        (MutexState::Unlocked(value, cs), Async::Ready(false))
-                    },
+                    Ok(Async::Ready((value, poisoned))) => self.satisfy_unlock_req(value, poisoned, completion),
                     // No unlock message yet
-                    Ok(Async::NotReady) => (MutexState::Locked(receiver, cs), Async::NotReady),
+                    Ok(Async::NotReady) => (Locked(receiver, completion), Async::NotReady),
                     // MutexGuard should never close the channel before sending an unlock message
                     Err(_) => unreachable!()
                 }
             },
             // We should never be polled while in this transient state
-            MutexState::Invalid => unreachable!()
+            Invalid => unreachable!()
         }
     }
 }
@@ -82,10 +91,15 @@ impl<T: Send> Future for MutexTask<T> {
     type Error = ();
 
     fn poll(&mut self) -> Poll<(), ()> {
+        // Run the state machine until it blocks
         loop {
-            let old_state = mem::replace(&mut self.state, MutexState::Invalid);
+            // Enter "Invalid" state temporarily
+            let old_state = mem::replace(&mut self.state, Invalid);
+            // Step the FSM
             let (new_state, result) = self.step(old_state);
+            // Enter the new state
             self.state = new_state;
+            // Check if we're done
             match result {
                 Async::NotReady => return Ok(Async::NotReady),
                 Async::Ready(true) => return Ok(Async::Ready(())),
@@ -97,13 +111,14 @@ impl<T: Send> Future for MutexTask<T> {
 
 impl<T: Send> Drop for MutexTask<T> {
     fn drop(&mut self) {
-        if let MutexState::Unlocked(value, cs) = mem::replace(&mut self.state, MutexState::Invalid) {
-            cs.complete(self.poison(value));
+        if let Unlocked(value, completion) = mem::replace(&mut self.state, Invalid) {
+            completion.complete(self.poison(value));
         }
     }
 }
 
 /// A handle to a future-based mutex
+#[derive(Clone)]
 pub struct Mutex<T: Send>(mpsc::Sender<LockRequest<T>>);
 
 struct MutexGuardInner<T: Send> {
@@ -155,6 +170,21 @@ impl<T: Send> Future for MutexCompletion<T> {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Canceled;
+
+impl fmt::Display for Canceled {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "Mutex canceled")
+    }
+}
+
+impl Error for Canceled {
+    fn description(&self) -> &str {
+        "Mutex canceled"
+    }
+}
+
 impl<T: Send> Mutex<T> {
     /// Create a new mutex and run it on the specified `Spawn` implementation
     pub fn new<S: Spawn<MutexTask<T>>>(value: T, spawn: &S) -> (Self, MutexCompletion<T>) {
@@ -162,9 +192,19 @@ impl<T: Send> Mutex<T> {
         let (completion_sender, completion_receiver) = oneshot::channel();
         spawn.spawn_detached(MutexTask {
             requests: receiver,
-            state: MutexState::Unlocked(value, completion_sender),
+            state: Unlocked(value, completion_sender),
             is_poisoned: false
         });
         (Mutex(sender), MutexCompletion(completion_receiver))
+    }
+
+    /// Attempt to lock the RwLock for writing
+    pub fn lock(self) -> impl Future<Item=(Mutex<T>, LockResult<MutexGuard<T>>), Error=Canceled> {
+        let (sender, receiver) = oneshot::channel();
+        self.0.send(
+            LockRequest(sender)
+        ).map(|c| Mutex(c)).map_err(|_|Canceled).join(
+            receiver.map_err(|_|Canceled)
+        )
     }
 }
