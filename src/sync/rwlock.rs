@@ -35,7 +35,7 @@ enum RwLockState<T: Send> {
     Invalid
 }
 
-/// Represents a living mutex. Never constructed directly.
+/// Represents a living rwlock. Never constructed directly.
 pub struct RwLockTask<T: Send> {
     requests: mpsc::Receiver<LockRequest<T>>,
     state: RwLockState<T>,
@@ -57,7 +57,7 @@ impl<T: Send> RwLockTask<T> {
             Unlocked { value, completion } => {
                 // Check for lock requests
                 match self.requests.poll() {
-                    // Lock request stream is closed, so mutex task should end
+                    // Lock request stream is closed, so rwlock task should end
                     Ok(Async::Ready(None)) => (Unlocked {
                         value: value,
                         completion: completion
@@ -175,7 +175,7 @@ impl<T: Send> RwLockTask<T> {
                 match unlock.poll() {
                     // Received an unlock message
                     Ok(Async::Ready((value, poisoned))) => {
-                        // Unlock and maybe poison the mutex
+                        // Unlock and maybe poison the rwlock
                         self.is_poisoned |= poisoned;
                         (Unlocked {
                             value: value,
@@ -223,7 +223,7 @@ impl<T: Send> Drop for RwLockTask<T> {
     }
 }
 
-/// A handle to a future-based mutex
+/// A handle to a future-based RwLock
 #[derive(Clone)]
 pub struct RwLock<T: Send>(mpsc::Sender<LockRequest<T>>);
 
@@ -327,7 +327,7 @@ impl Error for Canceled {
 }
 
 impl<T: Send> RwLock<T> {
-    /// Create a new mutex and run it on the specified `Spawn` implementation
+    /// Create a new rwlock and run it on the specified `Spawn` implementation
     pub fn new<S: Spawn<RwLockTask<T>>>(value: T, spawn: &S) -> (Self, RwLockCompletion<T>) {
         let (sender, receiver) = mpsc::channel(0);
         let (completion_sender, completion_receiver) = oneshot::channel();
