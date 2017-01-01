@@ -9,28 +9,33 @@ use std::error::Error;
 use self::RwLockState::*;
 
 
+type CompletionSender<T> = oneshot::Sender<LockResult<T>>;
+type WriteGuardSender<T> = oneshot::Sender<LockResult<RwLockWriteGuard<T>>>;
+type ReadGuardSender<T> = oneshot::Sender<LockResult<RwLockReadGuard<T>>>;
+type StepResult<T> = (RwLockState<T>, Async<bool>);
+
 enum LockRequest<T: Send> {
-    Exclusive(oneshot::Sender<LockResult<RwLockWriteGuard<T>>>),
-    Shared(oneshot::Sender<LockResult<RwLockReadGuard<T>>>)
+    Exclusive(WriteGuardSender<T>),
+    Shared(ReadGuardSender<T>)
 }
 
 enum RwLockState<T: Send> {
     Unlocked {
         value: T,
-        completion: oneshot::Sender<LockResult<T>>
+        completion: CompletionSender<T>
     },
     LockedRead {
         arc: Arc<T>,
-        completion: oneshot::Sender<LockResult<T>>
+        completion: CompletionSender<T>
     },
     LockedReadPendingWrite {
         arc: Arc<T>,
-        req: oneshot::Sender<LockResult<RwLockWriteGuard<T>>>,
-        completion: oneshot::Sender<LockResult<T>>
+        req: WriteGuardSender<T>,
+        completion: CompletionSender<T>
     },
     LockedWrite {
         unlock: oneshot::Receiver<(T, bool)>,
-        completion: oneshot::Sender<LockResult<T>>
+        completion: CompletionSender<T>
     },
     Invalid
 }
@@ -51,47 +56,76 @@ impl<T: Send> RwLockTask<T> {
         }
     }
 
-    fn step(&mut self, state: RwLockState<T>) -> (RwLockState<T>, Async<bool>) {
+    fn satisfy_write_req(&mut self, value: T, req: WriteGuardSender<T>, completion: CompletionSender<T>) -> StepResult<T> {
+        // Create a channel to receive the "unlock" message
+        let (sender, unlock) = oneshot::channel();
+        // Send a guard to the lucky locker
+        let guard = RwLockWriteGuard::new(value, sender);
+        req.complete(self.poison(guard));
+        // Transition to write locked state
+        (LockedWrite {
+            unlock: unlock,
+            completion: completion
+        }, Async::Ready(false))
+    }
+
+    fn satisfy_read_req(&mut self, arc: Arc<T>, req: ReadGuardSender<T>, completion: CompletionSender<T>) -> StepResult<T> {
+        // Send a guard to the lucky locker
+        let guard = RwLockReadGuard::new(arc.clone(), task::park());
+        req.complete(self.poison(guard));
+        // Transition to read locked state
+        (LockedRead {
+            arc: arc,
+            completion: completion
+        }, Async::Ready(false))
+    }
+
+    fn pending_write(&mut self, arc: Arc<T>, req: WriteGuardSender<T>, completion: CompletionSender<T>) -> StepResult<T> {
+        (LockedReadPendingWrite {
+            arc: arc,
+            req: req,
+            completion: completion
+        }, Async::Ready(false))
+    }
+
+    fn poll_read_unlocked(&mut self, arc: Arc<T>, completion: CompletionSender<T>, closed: bool) -> StepResult<T> {
+        match Arc::try_unwrap(arc) {
+            Ok(value) => (Unlocked {
+                value: value,
+                completion: completion
+            }, Async::Ready(closed)),
+            Err(arc) => {
+                (LockedRead {
+                    arc: arc,
+                    completion: completion
+                }, Async::NotReady)
+            }
+        }
+    }
+
+    fn satisfy_write_unlock(&mut self, value: T, poisoned: bool, completion: CompletionSender<T>) -> StepResult<T> {
+        // Unlock and maybe poison the rwlock
+        self.is_poisoned |= poisoned;
+        (Unlocked {
+            value: value,
+            completion: completion
+        }, Async::Ready(false))
+    }
+
+    fn step(&mut self, state: RwLockState<T>) -> StepResult<T> {
         match state {
             // RwLock is currently unlocked
             Unlocked { value, completion } => {
                 // Check for lock requests
                 match self.requests.poll() {
                     // Lock request stream is closed, so rwlock task should end
-                    Ok(Async::Ready(None)) => (Unlocked {
-                        value: value,
-                        completion: completion
-                    }, Async::Ready(true)),
-                    // Received a lock request
-                    Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => {
-                        // Create a channel to receive the "unlock" message
-                        let (sender, receiver) = oneshot::channel();
-                        // Send a guard to the lucky locker
-                        let guard = RwLockWriteGuard::new(value, sender);
-                        req.complete(self.poison(guard));
-                        // Transition to write locked state
-                        (LockedWrite {
-                            unlock: receiver,
-                            completion: completion
-                        }, Async::Ready(false))
-                    },
-                    Ok(Async::Ready(Some(LockRequest::Shared(req)))) => {
-                        let unlock = task::park();
-                        let arc = Arc::new(value);
-                        // Send a guard to the lucky locker
-                        let guard = RwLockReadGuard::new(arc.clone(), unlock);
-                        req.complete(self.poison(guard));
-                        // Transition to read locked state
-                        (LockedRead {
-                            arc: arc,
-                            completion: completion
-                        }, Async::Ready(false))
-                    },
+                    Ok(Async::Ready(None)) => (Unlocked { value: value, completion: completion }, Async::Ready(true)),
+                    // Received a write lock request
+                    Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => self.satisfy_write_req(value, req, completion),
+                    // Received a read lock request
+                    Ok(Async::Ready(Some(LockRequest::Shared(req)))) => self.satisfy_read_req(Arc::new(value), req, completion),
                     // No requests outstanding
-                    Ok(Async::NotReady) => (Unlocked {
-                        value: value,
-                        completion: completion
-                    }, Async::NotReady),
+                    Ok(Async::NotReady) => (Unlocked { value: value, completion: completion }, Async::NotReady),
                     // The mpsc::channel should never return errors...
                     Err(()) => unreachable!()
                 }
@@ -100,58 +134,15 @@ impl<T: Send> RwLockTask<T> {
             LockedRead { arc, completion } => {
                 // Check for any lock requests
                 match self.requests.poll() {
-                    // Lock request stream is closed, so do nothing.
-                    Ok(Async::Ready(None)) => {
-                        // Check if all read locks have been released
-                        match Arc::try_unwrap(arc) {
-                            Ok(value) => (Unlocked {
-                                value: value,
-                                completion: completion
-                            }, Async::Ready(true)),
-                            Err(arc) => {
-                                // Can't terminate while there are outstanding locks, so just keep polling.
-                                // Hopefully the stream is fused...
-                                (LockedRead {
-                                    arc: arc,
-                                    completion: completion
-                                }, Async::NotReady)
-                            }
-                        }
-                    },
+                    // Lock request stream is closed, so check if all read locks have been released
+                    // The request stream must be fused...
+                    Ok(Async::Ready(None)) => self.poll_read_unlocked(arc, completion, true),
                     // Received a write lock request
-                    Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => (LockedReadPendingWrite {
-                        arc: arc,
-                        req: req,
-                        completion: completion
-                    }, Async::Ready(false)),
+                    Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => self.pending_write(arc, req, completion),
                     // Received a read lock request
-                    Ok(Async::Ready(Some(LockRequest::Shared(req)))) => {
-                        let unlock = task::park();
-                        // Send a guard to the lucky locker
-                        let guard = RwLockReadGuard::new(arc.clone(), unlock);
-                        req.complete(self.poison(guard));
-                        // Transition to read locked state
-                        (LockedRead {
-                            arc: arc,
-                            completion: completion
-                        }, Async::Ready(false))
-                    },
+                    Ok(Async::Ready(Some(LockRequest::Shared(req)))) => self.satisfy_read_req(arc, req, completion),
                     // No requests outstanding
-                    Ok(Async::NotReady) => {
-                        // Check if all read locks have been released
-                        match Arc::try_unwrap(arc) {
-                            Ok(value) => (Unlocked {
-                                value: value,
-                                completion: completion
-                            }, Async::Ready(false)),
-                            Err(arc) => {
-                                (LockedRead {
-                                    arc: arc,
-                                    completion: completion
-                                }, Async::NotReady)
-                            }
-                        }
-                    },
+                    Ok(Async::NotReady) => self.poll_read_unlocked(arc, completion, false),
                     // The mpsc::channel should never return errors...
                     Err(()) => unreachable!()
                 }
@@ -160,25 +151,10 @@ impl<T: Send> RwLockTask<T> {
             LockedReadPendingWrite { arc, req, completion } => {
                 // Check if all read locks have been released
                 match Arc::try_unwrap(arc) {
-                    Ok(value) => {
-                        // Create a channel to receive the "unlock" message
-                        let (sender, unlock) = oneshot::channel();
-                        // Send a guard to the lucky locker
-                        let guard = RwLockWriteGuard::new(value, sender);
-                        req.complete(self.poison(guard));
-                        // Transition to write locked state
-                        (LockedWrite {
-                            unlock: unlock,
-                            completion: completion
-                        }, Async::Ready(false))
-                    },
-                    Err(arc) => {
-                        (LockedReadPendingWrite {
-                            arc: arc,
-                            req: req,
-                            completion: completion
-                        }, Async::NotReady)
-                    }
+                    // Read locks have been released
+                    Ok(value) => self.satisfy_write_req(value, req, completion),
+                    // There are still read locks outstanding
+                    Err(arc) => (LockedReadPendingWrite { arc: arc, req: req, completion: completion }, Async::NotReady)
                 }
             },
             // RwLock is currently write locked
@@ -186,19 +162,9 @@ impl<T: Send> RwLockTask<T> {
                 // Check for an unlock notification
                 match unlock.poll() {
                     // Received an unlock message
-                    Ok(Async::Ready((value, poisoned))) => {
-                        // Unlock and maybe poison the rwlock
-                        self.is_poisoned |= poisoned;
-                        (Unlocked {
-                            value: value,
-                            completion: completion
-                        }, Async::Ready(false))
-                    },
+                    Ok(Async::Ready((value, poisoned))) => self.satisfy_write_unlock(value, poisoned, completion),
                     // No unlock message yet
-                    Ok(Async::NotReady) => (LockedWrite {
-                        unlock: unlock,
-                        completion: completion
-                    }, Async::NotReady),
+                    Ok(Async::NotReady) => (LockedWrite { unlock: unlock, completion: completion }, Async::NotReady),
                     // RwLockWriteGuard should never close the channel before sending an unlock message
                     Err(_) => unreachable!()
                 }
@@ -214,10 +180,15 @@ impl<T: Send> Future for RwLockTask<T> {
     type Error = ();
 
     fn poll(&mut self) -> Poll<(), ()> {
+        // Run the state machine until it blocks
         loop {
+            // Enter "Invalid" state temporarily
             let old_state = mem::replace(&mut self.state, Invalid);
+            // Step the FSM
             let (new_state, result) = self.step(old_state);
+            // Enter the new state
             self.state = new_state;
+            // Check if we're done
             match result {
                 Async::NotReady => return Ok(Async::NotReady),
                 Async::Ready(true) => return Ok(Async::Ready(())),
