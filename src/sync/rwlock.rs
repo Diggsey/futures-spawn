@@ -101,11 +101,23 @@ impl<T: Send> RwLockTask<T> {
                 // Check for any lock requests
                 match self.requests.poll() {
                     // Lock request stream is closed, so do nothing.
-                    // Hopefully the stream is fused...
-                    Ok(Async::Ready(None)) => (LockedRead {
-                        arc: arc,
-                        completion: completion
-                    }, Async::NotReady),
+                    Ok(Async::Ready(None)) => {
+                        // Check if all read locks have been released
+                        match Arc::try_unwrap(arc) {
+                            Ok(value) => (Unlocked {
+                                value: value,
+                                completion: completion
+                            }, Async::Ready(true)),
+                            Err(arc) => {
+                                // Can't terminate while there are outstanding locks, so just keep polling.
+                                // Hopefully the stream is fused...
+                                (LockedRead {
+                                    arc: arc,
+                                    completion: completion
+                                }, Async::NotReady)
+                            }
+                        }
+                    },
                     // Received a write lock request
                     Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => (LockedReadPendingWrite {
                         arc: arc,
