@@ -9,6 +9,7 @@
 //! executor.
 
 #![deny(warnings, missing_docs)]
+#![feature(conservative_impl_trait)]
 
 extern crate futures;
 

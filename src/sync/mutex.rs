@@ -1,4 +1,4 @@
-use super::Spawn;
+use super::super::Spawn;
 use futures::sync::{mpsc, oneshot};
 use futures::{Future, Poll, Stream, Async};
 use std::thread;
