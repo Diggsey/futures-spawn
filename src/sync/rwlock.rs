@@ -117,34 +117,32 @@ impl<T: Send> RwLockTask<T> {
             // RwLock is currently unlocked
             Unlocked { value, completion } => {
                 // Check for lock requests
-                match self.requests.poll() {
+                // The mpsc::channel should never return errors...
+                match self.requests.poll().unwrap() {
                     // Lock request stream is closed, so rwlock task should end
-                    Ok(Async::Ready(None)) => (Unlocked { value: value, completion: completion }, Async::Ready(true)),
+                    Async::Ready(None) => (Unlocked { value: value, completion: completion }, Async::Ready(true)),
                     // Received a write lock request
-                    Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => self.satisfy_write_req(value, req, completion),
+                    Async::Ready(Some(LockRequest::Exclusive(req))) => self.satisfy_write_req(value, req, completion),
                     // Received a read lock request
-                    Ok(Async::Ready(Some(LockRequest::Shared(req)))) => self.satisfy_read_req(Arc::new(value), req, completion),
+                    Async::Ready(Some(LockRequest::Shared(req))) => self.satisfy_read_req(Arc::new(value), req, completion),
                     // No requests outstanding
-                    Ok(Async::NotReady) => (Unlocked { value: value, completion: completion }, Async::NotReady),
-                    // The mpsc::channel should never return errors...
-                    Err(()) => unreachable!()
+                    Async::NotReady => (Unlocked { value: value, completion: completion }, Async::NotReady),
                 }
             },
             // RwLock is currently read locked, with no pending write locks
             LockedRead { arc, completion } => {
                 // Check for any lock requests
-                match self.requests.poll() {
+                // The mpsc::channel should never return errors...
+                match self.requests.poll().unwrap() {
                     // Lock request stream is closed, so check if all read locks have been released
                     // The request stream must be fused...
-                    Ok(Async::Ready(None)) => self.poll_read_unlocked(arc, completion, true),
+                    Async::Ready(None) => self.poll_read_unlocked(arc, completion, true),
                     // Received a write lock request
-                    Ok(Async::Ready(Some(LockRequest::Exclusive(req)))) => self.pending_write(arc, req, completion),
+                    Async::Ready(Some(LockRequest::Exclusive(req))) => self.pending_write(arc, req, completion),
                     // Received a read lock request
-                    Ok(Async::Ready(Some(LockRequest::Shared(req)))) => self.satisfy_read_req(arc, req, completion),
+                    Async::Ready(Some(LockRequest::Shared(req))) => self.satisfy_read_req(arc, req, completion),
                     // No requests outstanding
-                    Ok(Async::NotReady) => self.poll_read_unlocked(arc, completion, false),
-                    // The mpsc::channel should never return errors...
-                    Err(()) => unreachable!()
+                    Async::NotReady => self.poll_read_unlocked(arc, completion, false),
                 }
             },
             // RwLock is currently read locked, with a pending write lock
@@ -160,13 +158,12 @@ impl<T: Send> RwLockTask<T> {
             // RwLock is currently write locked
             LockedWrite { mut unlock, completion } => {
                 // Check for an unlock notification
-                match unlock.poll() {
+                // RwLockWriteGuard should never close the channel before sending an unlock message
+                match unlock.poll().unwrap() {
                     // Received an unlock message
-                    Ok(Async::Ready((value, poisoned))) => self.satisfy_write_unlock(value, poisoned, completion),
+                    Async::Ready((value, poisoned)) => self.satisfy_write_unlock(value, poisoned, completion),
                     // No unlock message yet
-                    Ok(Async::NotReady) => (LockedWrite { unlock: unlock, completion: completion }, Async::NotReady),
-                    // RwLockWriteGuard should never close the channel before sending an unlock message
-                    Err(_) => unreachable!()
+                    Async::NotReady => (LockedWrite { unlock: unlock, completion: completion }, Async::NotReady)
                 }
             },
             // We should never be polled while in this transient state

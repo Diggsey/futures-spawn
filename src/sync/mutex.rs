@@ -57,27 +57,25 @@ impl<T: Send> MutexTask<T> {
             // Mutex is currently unlocked
             Unlocked(value, completion) => {
                 // Check for lock requests
-                match self.requests.poll() {
+                // The mpsc::channel should never return errors...
+                match self.requests.poll().unwrap() {
                     // Lock request stream is closed, so mutex task should end
-                    Ok(Async::Ready(None)) => (Unlocked(value, completion), Async::Ready(true)),
+                    Async::Ready(None) => (Unlocked(value, completion), Async::Ready(true)),
                     // Received a lock request
-                    Ok(Async::Ready(Some(LockRequest(req)))) => self.satisfy_lock_req(value, req, completion),
+                    Async::Ready(Some(LockRequest(req))) => self.satisfy_lock_req(value, req, completion),
                     // No requests outstanding
-                    Ok(Async::NotReady) => (Unlocked(value, completion), Async::NotReady),
-                    // The mpsc::channel should never return errors...
-                    Err(()) => unreachable!()
+                    Async::NotReady => (Unlocked(value, completion), Async::NotReady),
                 }
             },
             // Mutex is currently locked
             Locked(mut receiver, completion) => {
                 // Check for an unlock notification
-                match receiver.poll() {
+                // MutexGuard should never close the channel before sending an unlock message
+                match receiver.poll().unwrap() {
                     // Received an unlock message
-                    Ok(Async::Ready((value, poisoned))) => self.satisfy_unlock_req(value, poisoned, completion),
+                    Async::Ready((value, poisoned)) => self.satisfy_unlock_req(value, poisoned, completion),
                     // No unlock message yet
-                    Ok(Async::NotReady) => (Locked(receiver, completion), Async::NotReady),
-                    // MutexGuard should never close the channel before sending an unlock message
-                    Err(_) => unreachable!()
+                    Async::NotReady => (Locked(receiver, completion), Async::NotReady),
                 }
             },
             // We should never be polled while in this transient state
